@@ -7,7 +7,7 @@ load_dotenv()
 
 TOKEN = os.getenv("TOKEN")
 
-BASE_URL = f"https://tapi.bale.ai/bot{TOKEN}"
+BASE_URL = f"http://tapi.bale.ai/bot{TOKEN}"
 
 def send_message(chat_id, text):
     url = f"{BASE_URL}/sendMessage"
@@ -15,7 +15,7 @@ def send_message(chat_id, text):
         "chat_id": chat_id,
         "text": text
     }
-    response = requests.post(url, json=data, verify=False)
+    response = requests.post(url, json=data)
     print("send response:", response.status_code, response.text)
 
 def get_updates(offset=None):
@@ -23,7 +23,7 @@ def get_updates(offset=None):
     params = {}
     if offset:
         params['offset'] = offset
-    response = requests.get(url, params=params, verify=False)
+    response = requests.get(url, params=params)
     return response.json()
 
 def run_bot():
