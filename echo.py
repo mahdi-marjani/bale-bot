@@ -1,7 +1,12 @@
-import requests
+import os
 import time
+import requests
+from dotenv import load_dotenv
 
-TOKEN = "..."
+load_dotenv()
+
+TOKEN = os.getenv("TOKEN")
+
 BASE_URL = f"https://tapi.bale.ai/bot{TOKEN}"
 
 def send_message(chat_id, text):
