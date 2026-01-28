@@ -8,7 +8,7 @@ load_dotenv()
 
 apihelper.API_URL = "https://tapi.bale.ai/bot{0}/{1}"
 
-TOKEN = os.getenv("TOKEN")
+TOKEN = os.getenv("BALE_BOT_TOKEN")
 
 bot = telebot.TeleBot(TOKEN)
 
