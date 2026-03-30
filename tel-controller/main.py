@@ -7,12 +7,14 @@ from datetime import datetime
 from dotenv import load_dotenv
 import telebot
 import telebot.apihelper as apihelper
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from telethon import TelegramClient, events
 from telethon.tl.functions.channels import JoinChannelRequest, LeaveChannelRequest
 from telethon.tl.functions.messages import GetBotCallbackAnswerRequest, ImportChatInviteRequest
 from telethon.tl.types import (
     MessageEntityTextUrl, MessageEntityUrl, MessageEntityMention,
-    MessageEntityHashtag, KeyboardButtonCallback, KeyboardButtonUrl
+    MessageEntityHashtag, KeyboardButtonCallback, KeyboardButtonUrl,
+    UserStatusOnline, UserStatusOffline, UserStatusRecently, UserStatusLastWeek, UserStatusLastMonth
 )
 from telethon.utils import get_display_name
 
@@ -53,7 +55,7 @@ os.makedirs("downloads", exist_ok=True)
 os.makedirs("splits", exist_ok=True)
 
 PENDING_UPLOADS = {}
-BALE_TO_TG = {}  # bale_msg_id -> (tg_chat_id, tg_msg_id)
+BALE_TO_TG = {}
 
 def split_file(file_path, chunk_size):
     parts = []
@@ -131,6 +133,7 @@ def start_handler(message):
         "/sendfile <@user> - Send a file (then upload the file)\n"
         "/history <@chat> [count] - Get recent messages (text only)\n"
         "/download [url] - Download file from a message (reply to a history message or provide URL)\n"
+        "/user <@user|id> - Get user info (profile photo, name, bio, last seen)\n"
         "/admins - List admins\n"
         "/remove_admin <user_id> - Remove admin\n"
         "/clickbutton <index> - Reply to a button list message to click a button"
@@ -217,7 +220,14 @@ def msg_handler(message):
         return
     target = args[1]
     text = args[2]
-    asyncio.run_coroutine_threadsafe(send_tg_text(target, text, message), tg_loop)
+    asyncio.run_coroutine_threadsafe(send_tg_text(target, text), tg_loop)
+    bot.send_message(
+        message.chat.id,
+        f"✅ Message sent to {target}.",
+        reply_markup=InlineKeyboardMarkup().add(
+            InlineKeyboardButton("📋 History (5)", callback_data=f"history:{target}:5")
+        )
+    )
 
 @bot.message_handler(commands=['sendfile'])
 def sendfile_handler(message):
@@ -252,13 +262,22 @@ def history_handler(message):
             count = 10
     asyncio.run_coroutine_threadsafe(get_history(target, count, message), tg_loop)
 
+@bot.message_handler(commands=['user'])
+def user_handler(message):
+    if not is_admin(message.from_user.id):
+        return
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        bot.reply_to(message, "Usage: /user @username or user_id")
+        return
+    target = args[1].strip()
+    asyncio.run_coroutine_threadsafe(get_user_info(target, message), tg_loop)
+
 @bot.message_handler(commands=['download'])
 def download_handler(message):
     if not is_admin(message.from_user.id):
         return
-    # Send immediate acknowledgment
     progress_msg = bot.reply_to(message, "⏳ Processing download request...")
-    # Check if it's a reply to a message with mapping
     if message.reply_to_message:
         orig_bale_id = message.reply_to_message.message_id
         if orig_bale_id in BALE_TO_TG:
@@ -268,14 +287,12 @@ def download_handler(message):
                 tg_loop
             )
             return
-    # If not a reply, try to parse URL from args
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
-        bot.edit_message_text("❌ Usage: /download <url> or reply to a message from /history", 
+        bot.edit_message_text("❌ Usage: /download <url> or reply to a message from /history",
                               message.chat.id, progress_msg.message_id)
         return
     url = args[1].strip()
-    # Parse Telegram message URL
     match = re.search(r't\.me/(?:c/)?([^/]+)/(\d+)', url)
     if not match:
         bot.edit_message_text("❌ Invalid Telegram message URL.", message.chat.id, progress_msg.message_id)
@@ -381,15 +398,12 @@ async def leave_channel(target, reply_to_bale_msg=None):
         if reply_to_bale_msg:
             bot.reply_to(reply_to_bale_msg, f"❌ Error: {e}")
 
-async def send_tg_text(target, text, reply_to_bale_msg=None):
+async def send_tg_text(target, text):
     try:
         entity = await client.get_entity(target)
         await client.send_message(entity, text)
-        if reply_to_bale_msg:
-            bot.reply_to(reply_to_bale_msg, "✅ Message sent.")
     except Exception as e:
-        if reply_to_bale_msg:
-            bot.reply_to(reply_to_bale_msg, f"❌ Error: {e}")
+        print(f"Error sending message: {e}")
 
 async def send_tg_file(target, file_path, reply_to_bale_msg=None):
     try:
@@ -400,13 +414,61 @@ async def send_tg_file(target, file_path, reply_to_bale_msg=None):
             for part in parts:
                 await client.send_file(entity, part)
                 os.remove(part)
-            bot.reply_to(reply_to_bale_msg, "✅ File sent in parts.")
+            if reply_to_bale_msg:
+                bot.reply_to(reply_to_bale_msg, "✅ File sent in parts.")
         else:
             await client.send_file(entity, file_path)
-            bot.reply_to(reply_to_bale_msg, "✅ File sent.")
+            if reply_to_bale_msg:
+                bot.reply_to(reply_to_bale_msg, "✅ File sent.")
         os.remove(file_path)
     except Exception as e:
-        bot.reply_to(reply_to_bale_msg, f"❌ Error: {e}")
+        if reply_to_bale_msg:
+            bot.reply_to(reply_to_bale_msg, f"❌ Error: {e}")
+
+async def get_user_info(target, bale_message):
+    try:
+        entity = await client.get_entity(target)
+        if hasattr(entity, 'username') and entity.username:
+            username = f"@{entity.username}"
+        else:
+            username = "None"
+        first_name = getattr(entity, 'first_name', '')
+        last_name = getattr(entity, 'last_name', '')
+        full_name = f"{first_name} {last_name}".strip() if first_name else (last_name or "None")
+        bio = getattr(entity, 'about', 'None')
+        status = getattr(entity, 'status', None)
+        last_seen = "Unknown"
+        if status:
+            if isinstance(status, UserStatusOnline):
+                last_seen = "🟢 Online"
+            elif isinstance(status, UserStatusOffline):
+                last_seen = f"Last seen: {status.was_online.strftime('%Y-%m-%d %H:%M:%S')}"
+            elif isinstance(status, UserStatusRecently):
+                last_seen = "Last seen recently"
+            elif isinstance(status, UserStatusLastWeek):
+                last_seen = "Last seen last week"
+            elif isinstance(status, UserStatusLastMonth):
+                last_seen = "Last seen last month"
+        info = f"👤 *{full_name}*\n"
+        info += f"🆔 ID: `{entity.id}`\n"
+        info += f"📛 Username: {username}\n"
+        if bio != 'None':
+            info += f"📝 Bio: {bio}\n"
+        info += f"⏱ {last_seen}"
+        photos = await client.get_profile_photos(entity, limit=1)
+        if photos:
+            photo = photos[0]
+            file_path = await client.download_media(photo, file="downloads/")
+            if file_path:
+                with open(file_path, 'rb') as f:
+                    bot.send_photo(bale_message.chat.id, f, caption=info, parse_mode="Markdown")
+                os.remove(file_path)
+            else:
+                bot.send_message(bale_message.chat.id, info, parse_mode="Markdown")
+        else:
+            bot.send_message(bale_message.chat.id, info, parse_mode="Markdown")
+    except Exception as e:
+        bot.reply_to(bale_message, f"❌ Error: {e}")
 
 async def get_history(chat_identifier, limit, reply_to_bale_msg):
     try:
@@ -416,26 +478,23 @@ async def get_history(chat_identifier, limit, reply_to_bale_msg):
             bot.reply_to(reply_to_bale_msg, "No messages found.")
             return
 
-        for msg in reversed(messages):  # oldest first
-            # Sender name
+        for msg in reversed(messages):
             sender = await msg.get_sender()
             sender_name = get_display_name(sender) if sender else "Unknown"
-            # Date
             date = msg.date.strftime("%Y-%m-%d %H:%M:%S")
-            # Message link
             link = None
             if hasattr(entity, 'username') and entity.username:
                 link = f"https://t.me/{entity.username}/{msg.id}"
             elif hasattr(entity, 'id') and isinstance(entity.id, int) and entity.id < 0:
                 channel_id = str(entity.id)[4:]
                 link = f"https://t.me/c/{channel_id}/{msg.id}"
-            # Text
             text = msg.message or ""
             if msg.entities:
                 text = entities_to_html(text, msg.entities)
-            # Media info (text only)
             media_info = ""
+            has_media = False
             if msg.media:
+                has_media = True
                 media_type = "📎 File"
                 size = None
                 if msg.document:
@@ -465,7 +524,6 @@ async def get_history(chat_identifier, limit, reply_to_bale_msg):
                 else:
                     media_info = media_type
 
-            # Build message content
             content = f"👤 {sender_name} • {date}\n"
             if text:
                 content += text + "\n"
@@ -474,11 +532,14 @@ async def get_history(chat_identifier, limit, reply_to_bale_msg):
             if link:
                 content += f"🔗 <a href='{link}'>Link</a>"
 
-            # Send the message and store mapping for replies
-            bale_msg = bot.send_message(reply_to_bale_msg.chat.id, content, parse_mode="HTML")
+            markup = None
+            if has_media:
+                markup = InlineKeyboardMarkup()
+                markup.add(InlineKeyboardButton("⬇️ Download", callback_data="download_btn"))
+
+            bale_msg = bot.send_message(reply_to_bale_msg.chat.id, content, parse_mode="HTML", reply_markup=markup)
             BALE_TO_TG[bale_msg.message_id] = (entity.id, msg.id)
 
-            # Handle buttons (if any)
             buttons = msg.buttons if hasattr(msg, 'buttons') and msg.buttons else None
             if buttons:
                 button_list = []
@@ -500,13 +561,23 @@ async def get_history(chat_identifier, limit, reply_to_bale_msg):
                                 'url': btn.button.url
                             })
                 if button_list:
+                    inline_buttons = []
+                    for idx, b in enumerate(button_list, start=1):
+                        if b['type'] == 'callback':
+                            cb_data = f"cb:{entity.id}:{msg.id}:{b['data']}"
+                            inline_buttons.append(InlineKeyboardButton(str(idx), callback_data=cb_data))
+                        else:
+                            inline_buttons.append(InlineKeyboardButton(b['text'], url=b['url']))
+                    rows = [inline_buttons[i:i+3] for i in range(0, len(inline_buttons), 3)]
+                    markup_buttons = InlineKeyboardMarkup(rows)
                     list_text = "📋 *Buttons:*\n" + format_buttons_list(button_list)
-                    list_msg = bot.send_message(reply_to_bale_msg.chat.id, list_text, parse_mode="Markdown")
+                    list_msg = bot.send_message(reply_to_bale_msg.chat.id, list_text, parse_mode="Markdown", reply_markup=markup_buttons)
                     BUTTON_LISTS[list_msg.message_id] = (entity.id, msg.id, button_list)
     except Exception as e:
         bot.reply_to(reply_to_bale_msg, f"❌ Error fetching history: {e}")
 
 async def download_message(chat_id, msg_id, bale_message, progress_msg):
+    file_path = None
     try:
         entity = await client.get_entity(chat_id)
         msg = await client.get_messages(entity, ids=msg_id)
@@ -517,66 +588,61 @@ async def download_message(chat_id, msg_id, bale_message, progress_msg):
             bot.edit_message_text("❌ No media in this message.", bale_message.chat.id, progress_msg.message_id)
             return
 
-        # Notify download start
         file_size_mb = None
         if msg.document and msg.document.size:
             file_size_mb = msg.document.size / (1024 * 1024)
-            bot.edit_message_text(f"⬇️ Downloading file... ({file_size_mb:.1f} MB)", 
+            bot.edit_message_text(f"⬇️ Downloading file... ({file_size_mb:.1f} MB)",
                                   bale_message.chat.id, progress_msg.message_id)
         else:
-            bot.edit_message_text("⬇️ Downloading file...", 
+            bot.edit_message_text("⬇️ Downloading file...",
                                   bale_message.chat.id, progress_msg.message_id)
 
-        # Download the file
         file_path = await client.download_media(msg, file="downloads/")
         if not file_path:
             bot.edit_message_text("❌ Failed to download file.", bale_message.chat.id, progress_msg.message_id)
             return
 
-        # Check size and send
         size = os.path.getsize(file_path)
-        bot.edit_message_text(f"📤 Sending file ({size/(1024*1024):.1f} MB)...", 
+        bot.edit_message_text(f"📤 Sending file ({size/(1024*1024):.1f} MB)...",
                               bale_message.chat.id, progress_msg.message_id)
 
         if size > CHUNK_SIZE:
             parts = split_file(file_path, CHUNK_SIZE)
-            # Get base name without extension for the reassembly command
             base_name = os.path.basename(file_path)
             base_no_ext, ext = os.path.splitext(base_name)
-            # Send parts
             for part in parts:
                 with open(part, 'rb') as f:
                     bot.send_document(bale_message.chat.id, f, caption=f"📎 {os.path.basename(part)}")
                 os.remove(part)
-            # Correct reassembly command: cat base_no_ext.part*.ext > base_name
-            # Example: cat Three-Days-Grace-Animal-I-Have-Become.part*.mp4 > Three-Days-Grace-Animal-I-Have-Become.mp4
             reassembly = f"`cat {base_no_ext}.part*{ext} > {base_name}`"
-            bot.send_message(bale_message.chat.id, 
-                             f"📦 File split into {len(parts)} parts. To reassemble:\n{reassembly}", 
+            bot.send_message(bale_message.chat.id,
+                             f"📦 File split into {len(parts)} parts. To reassemble:\n{reassembly}",
                              parse_mode="Markdown")
         else:
             with open(file_path, 'rb') as f:
                 bot.send_document(bale_message.chat.id, f, caption=f"📎 {os.path.basename(file_path)}")
         os.remove(file_path)
-        # Delete progress message
+        file_path = None
         bot.delete_message(bale_message.chat.id, progress_msg.message_id)
     except Exception as e:
+        if file_path and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except:
+                pass
         bot.edit_message_text(f"❌ Error downloading: {e}", bale_message.chat.id, progress_msg.message_id)
 
 async def download_message_by_url(chat_part, msg_id, bale_message, progress_msg):
     try:
         if chat_part.isdigit():
-            # Might be a channel ID (e.g., 123456789)
             try:
                 entity = await client.get_entity(int(chat_part))
             except:
-                # Try with -100 prefix if it's a channel
                 try:
                     entity = await client.get_entity(int(f"-100{chat_part}"))
                 except:
                     raise Exception("Cannot find entity with that ID.")
         else:
-            # Username
             entity = await client.get_entity(f"@{chat_part}")
         await download_message(entity.id, msg_id, bale_message, progress_msg)
     except Exception as e:
@@ -590,14 +656,79 @@ async def send_callback_answer(chat_id, message_id, callback_data, bale_message)
             msg_id=message_id,
             data=callback_data.encode('utf-8')
         ))
-        if result.message:
-            bot.send_message(bale_message.chat.id, f"📝 {result.message}")
-        elif result.alert:
-            bot.send_message(bale_message.chat.id, f"🔔 {result.alert}")
+        target = None
+        if hasattr(entity, 'username') and entity.username:
+            target = f"@{entity.username}"
         else:
-            bot.send_message(bale_message.chat.id, "✅ Callback sent.")
+            target = str(chat_id)
+        if result.message:
+            bot.send_message(bale_message.chat.id, f"📝 {result.message}",
+                             reply_markup=InlineKeyboardMarkup().add(
+                                 InlineKeyboardButton("📋 History (5)", callback_data=f"history:{target}:5")
+                             ))
+        elif result.alert:
+            bot.send_message(bale_message.chat.id, f"🔔 {result.alert}",
+                             reply_markup=InlineKeyboardMarkup().add(
+                                 InlineKeyboardButton("📋 History (5)", callback_data=f"history:{target}:5")
+                             ))
+        else:
+            bot.send_message(bale_message.chat.id, "✅ Callback sent.",
+                             reply_markup=InlineKeyboardMarkup().add(
+                                 InlineKeyboardButton("📋 History (5)", callback_data=f"history:{target}:5")
+                             ))
     except Exception as e:
         bot.send_message(bale_message.chat.id, f"❌ Error sending callback: {e}")
+
+@bot.callback_query_handler(func=lambda call: True)
+def callback_query_handler(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "Not authorized.")
+        return
+
+    data = call.data
+    if data.startswith("history:"):
+        parts = data.split(":", 2)
+        if len(parts) >= 2:
+            target = parts[1]
+            count = 5
+            if len(parts) == 3:
+                try:
+                    count = int(parts[2])
+                except:
+                    pass
+            bot.answer_callback_query(call.id, f"Fetching last {count} messages...")
+            asyncio.run_coroutine_threadsafe(
+                get_history(target, count, call.message),
+                tg_loop
+            )
+    elif data == "download_btn":
+        bale_msg_id = call.message.message_id
+        if bale_msg_id in BALE_TO_TG:
+            chat_id, tg_msg_id = BALE_TO_TG[bale_msg_id]
+            progress_msg = bot.send_message(call.message.chat.id, "⏳ Processing download...")
+            asyncio.run_coroutine_threadsafe(
+                download_message(chat_id, tg_msg_id, call.message, progress_msg),
+                tg_loop
+            )
+        else:
+            bot.answer_callback_query(call.id, "Cannot find original message.")
+    elif data.startswith("cb:"):
+        parts = data.split(":", 3)
+        if len(parts) == 4:
+            _, tg_chat_str, tg_msg_str, callback_data = parts
+            try:
+                tg_chat = int(tg_chat_str)
+                tg_msg = int(tg_msg_str)
+                asyncio.run_coroutine_threadsafe(
+                    send_callback_answer(tg_chat, tg_msg, callback_data, call.message),
+                    tg_loop
+                )
+            except Exception as e:
+                bot.answer_callback_query(call.id, f"Error: {e}")
+        else:
+            bot.answer_callback_query(call.id, "Invalid callback data.")
+    else:
+        bot.answer_callback_query(call.id, "Unknown action.")
 
 @bot.message_handler(func=lambda m: m.reply_to_message and is_admin(m.from_user.id))
 def reply_handler(message):
