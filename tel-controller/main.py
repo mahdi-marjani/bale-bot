@@ -10,7 +10,7 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from telethon import TelegramClient
 from telethon.tl.functions.channels import JoinChannelRequest, LeaveChannelRequest
 from telethon.tl.functions.messages import GetBotCallbackAnswerRequest, ImportChatInviteRequest, ForwardMessagesRequest
-from telethon.tl.types import KeyboardButtonCallback, KeyboardButtonUrl, MessageEntityTextUrl, MessageEntityUrl, MessageEntityMention, MessageEntityHashtag
+from telethon.tl.types import KeyboardButtonCallback, KeyboardButtonUrl, MessageEntityTextUrl, MessageEntityUrl, MessageEntityMention, MessageEntityHashtag, ReplyKeyboardMarkup
 from telethon.utils import get_display_name
 
 load_dotenv()
@@ -34,6 +34,7 @@ client = TelegramClient(
 CHUNK_SIZE = 10 * 1024 * 1024
 ADMINS_FILE = "admins.json"
 BUTTON_LISTS = {}
+REPLY_KEYBOARD_LISTS = {}
 
 def load_admins():
     if os.path.exists(ADMINS_FILE):
@@ -77,6 +78,12 @@ def format_buttons_list(buttons, start_index=1):
             lines.append(f"{i}: {btn['text']} (callback)")
         else:
             lines.append(f"{i}: {btn['text']} (url: {btn['url']})")
+    return "\n".join(lines)
+
+def format_reply_keyboard_list(buttons, start_index=1):
+    lines = []
+    for i, btn_text in enumerate(buttons, start=start_index):
+        lines.append(f'{i}: "{btn_text}"')
     return "\n".join(lines)
 
 def is_admin(user_id):
@@ -132,8 +139,10 @@ def start_handler(message):
         "/user <@user|id> - Get user info\n"
         "/admins - List admins\n"
         "/remove_admin <user_id> - Remove admin\n"
-        "/clickbutton <index> - Reply to a button list message to click a button\n"
-        "/forward <@target> - Forward replied message to target chat"
+        "/clickbutton <index> - Reply to a button list message to click an inline button\n"
+        "/forward <@target> - Forward replied message to target chat\n"
+        "/botmenu <@bot> - Get bot's menu (text + inline buttons + reply keyboard as clickable numbers)\n"
+        "/clickkeyboard <index> - Reply to a reply keyboard list message to press a keyboard button (alternative to clickable buttons)"
     )
     bot.reply_to(message, help_text)
 
@@ -310,7 +319,7 @@ def clickbutton_handler(message):
         return
     list_msg_id = message.reply_to_message.message_id
     if list_msg_id not in BUTTON_LISTS:
-        bot.reply_to(message, "This message does not contain a button list.")
+        bot.reply_to(message, "This message does not contain an inline button list.")
         return
     args = message.text.split()
     if len(args) < 2:
@@ -359,6 +368,54 @@ def forward_handler(message):
         forward_tg_message(tg_chat_id, tg_msg_id, target, message),
         tg_loop
     )
+
+@bot.message_handler(commands=['botmenu'])
+def botmenu_handler(message):
+    if not is_admin(message.from_user.id):
+        return
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        bot.reply_to(message, "Usage: /botmenu @bot_username")
+        return
+    bot_username = args[1].strip()
+    if not bot_username.startswith('@'):
+        bot_username = '@' + bot_username
+    progress_msg = bot.reply_to(message, f"Fetching menu from {bot_username}...")
+    asyncio.run_coroutine_threadsafe(
+        get_bot_menu(bot_username, message, progress_msg),
+        tg_loop
+    )
+
+@bot.message_handler(commands=['clickkeyboard'])
+def clickkeyboard_handler(message):
+    if not is_admin(message.from_user.id):
+        return
+    if not message.reply_to_message:
+        bot.reply_to(message, "Please reply to a reply keyboard list message with this command.")
+        return
+    list_msg_id = message.reply_to_message.message_id
+    if list_msg_id not in REPLY_KEYBOARD_LISTS:
+        bot.reply_to(message, "This message does not contain a reply keyboard list.")
+        return
+    args = message.text.split()
+    if len(args) < 2:
+        bot.reply_to(message, "Usage: reply to a keyboard list with /clickkeyboard <index>")
+        return
+    try:
+        idx = int(args[1])
+    except ValueError:
+        bot.reply_to(message, "Invalid index. Use a number.")
+        return
+    bot_entity, button_texts = REPLY_KEYBOARD_LISTS[list_msg_id]
+    if idx < 1 or idx > len(button_texts):
+        bot.reply_to(message, f"Index out of range. Valid: 1..{len(button_texts)}")
+        return
+    selected_text = button_texts[idx-1]
+    asyncio.run_coroutine_threadsafe(
+        send_tg_text(bot_entity.username if hasattr(bot_entity, 'username') else bot_entity.id, selected_text),
+        tg_loop
+    )
+    bot.reply_to(message, f"Sent command '{selected_text}' to {bot_entity.username}.")
 
 @bot.message_handler(content_types=['document', 'photo', 'video', 'audio'])
 def file_received(message):
@@ -550,6 +607,125 @@ async def get_user_info(target, bale_message):
             bot.send_message(bale_message.chat.id, info)
     except Exception as e:
         bot.reply_to(bale_message, f"Error: {e}")
+
+async def get_bot_menu(bot_username, bale_message, progress_msg):
+    try:
+        entity = await client.get_entity(bot_username)
+        bot.edit_message_text(f"Sending /start to {bot_username}...", bale_message.chat.id, progress_msg.message_id)
+        await client.send_message(entity, "/start")
+        await asyncio.sleep(2)
+        messages = await client.get_messages(entity, limit=1)
+        if not messages:
+            bot.edit_message_text("No response from bot.", bale_message.chat.id, progress_msg.message_id)
+            return
+        response = messages[0]
+
+        reply_keyboard = None
+        if response.reply_markup and isinstance(response.reply_markup, ReplyKeyboardMarkup):
+            reply_keyboard = response.reply_markup
+
+        if response.text:
+            sender = await response.get_sender()
+            sender_name = get_display_name(sender) if sender else "Bot"
+            date = response.date.strftime("%Y-%m-%d %H:%M:%S")
+            link = None
+            if hasattr(entity, 'username') and entity.username:
+                link = f"https://t.me/{entity.username}/{response.id}"
+            content = f"👤 {sender_name} • {date}\n{response.text}"
+            if link:
+                content += f"\n🔗 {link}"
+            bale_msg = bot.send_message(bale_message.chat.id, content)
+            BALE_TO_TG[bale_msg.message_id] = (entity.id, response.id)
+        elif response.media:
+            bot.edit_message_text("Bot replied with media. Use /history to see it.", bale_message.chat.id, progress_msg.message_id)
+            return
+        else:
+            bot.edit_message_text("Empty response from bot.", bale_message.chat.id, progress_msg.message_id)
+            return
+
+        buttons = response.buttons if hasattr(response, 'buttons') and response.buttons else None
+        if buttons:
+            button_list = []
+            for row in buttons:
+                for btn in row:
+                    if isinstance(btn.button, KeyboardButtonCallback):
+                        data = btn.button.data
+                        if isinstance(data, bytes):
+                            data = data.decode('utf-8')
+                        button_list.append({
+                            'type': 'callback',
+                            'text': btn.text,
+                            'data': data
+                        })
+                    elif isinstance(btn.button, KeyboardButtonUrl):
+                        button_list.append({
+                            'type': 'url',
+                            'text': btn.text,
+                            'url': btn.button.url
+                        })
+            if button_list:
+                inline_buttons = []
+                for idx, b in enumerate(button_list, start=1):
+                    if b['type'] == 'callback':
+                        cb_data = f"cb:{entity.id}:{response.id}:{b['data']}"
+                        inline_buttons.append(InlineKeyboardButton(str(idx), callback_data=cb_data))
+                    else:
+                        inline_buttons.append(InlineKeyboardButton(b['text'], url=b['url']))
+                rows = [inline_buttons[i:i+3] for i in range(0, len(inline_buttons), 3)]
+                markup = InlineKeyboardMarkup(rows)
+                list_text = "Inline Buttons:\n" + format_buttons_list(button_list)
+                bot.send_message(bale_message.chat.id, list_text, reply_markup=markup)
+                BUTTON_LISTS[bale_msg.message_id] = (entity.id, response.id, button_list)
+
+        if reply_keyboard:
+            button_texts = []
+            for row in reply_keyboard.rows:
+                for btn in row.buttons:
+                    button_texts.append(btn.text)
+            if button_texts:
+                reply_inline_buttons = []
+                for idx, btn_text in enumerate(button_texts, start=1):
+                    import uuid
+                    action_id = str(uuid.uuid4())
+                    REPLY_KB_ACTIONS[action_id] = (entity, btn_text)
+                    reply_inline_buttons.append(InlineKeyboardButton(str(idx), callback_data=f"replykb:{action_id}"))
+                rows = [reply_inline_buttons[i:i+5] for i in range(0, len(reply_inline_buttons), 5)]
+                markup = InlineKeyboardMarkup(rows)
+                list_text = "Reply Keyboard Buttons:\n" + format_reply_keyboard_list(button_texts)
+                bot.send_message(bale_message.chat.id, list_text, reply_markup=markup)
+
+        bot.delete_message(bale_message.chat.id, progress_msg.message_id)
+    except Exception as e:
+        bot.edit_message_text(f"Error: {e}", bale_message.chat.id, progress_msg.message_id)
+
+REPLY_KB_ACTIONS = {}
+
+async def send_reply_keyboard_press(bot_entity, button_text, bale_chat_id):
+    try:
+        await client.send_message(bot_entity, button_text)
+        await asyncio.sleep(1)
+        messages = await client.get_messages(bot_entity, limit=1)
+        if messages:
+            response = messages[0]
+            if response.text:
+                sender = await response.get_sender()
+                sender_name = get_display_name(sender) if sender else bot_entity.username
+                date = response.date.strftime("%Y-%m-%d %H:%M:%S")
+                link = None
+                if hasattr(bot_entity, 'username') and bot_entity.username:
+                    link = f"https://t.me/{bot_entity.username}/{response.id}"
+                content = f"👤 {sender_name} • {date}\n{response.text}"
+                if link:
+                    content += f"\n🔗 {link}"
+                bot.send_message(bale_chat_id, content)
+                bale_msg = bot.send_message(bale_chat_id, "Response shown above.")
+                BALE_TO_TG[bale_msg.message_id] = (bot_entity.id, response.id)
+            elif response.media:
+                bot.send_message(bale_chat_id, "Bot replied with media. Use /history to see it.")
+            else:
+                bot.send_message(bale_chat_id, "No text response from bot.")
+    except Exception as e:
+        bot.send_message(bale_chat_id, f"Error sending keyboard press: {e}")
 
 async def get_history(chat_identifier, limit, reply_to_bale_msg):
     try:
@@ -806,6 +982,17 @@ def callback_query_handler(call):
                 bot.answer_callback_query(call.id, f"Error: {e}")
         else:
             bot.answer_callback_query(call.id, "Invalid callback data.")
+    elif data.startswith("replykb:"):
+        action_id = data.split(":", 1)[1]
+        if action_id in REPLY_KB_ACTIONS:
+            bot_entity, button_text = REPLY_KB_ACTIONS.pop(action_id)
+            bot.answer_callback_query(call.id, f"Sending '{button_text}'...")
+            asyncio.run_coroutine_threadsafe(
+                send_reply_keyboard_press(bot_entity, button_text, call.message.chat.id),
+                tg_loop
+            )
+        else:
+            bot.answer_callback_query(call.id, "Action expired or invalid.")
     else:
         bot.answer_callback_query(call.id, "Unknown action.")
 
