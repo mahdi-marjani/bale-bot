@@ -22,6 +22,7 @@ TG_SESSION = os.getenv("TG_SESSION_NAME")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
 
 apihelper.API_URL = "https://tapi.bale.ai/bot{0}/{1}"
+apihelper.FILE_URL = "https://tapi.bale.ai/file/bot{0}/{1}"
 bot = telebot.TeleBot(BALE_TOKEN)
 
 client = TelegramClient(
@@ -234,8 +235,8 @@ def sendfile_handler(message):
         bot.reply_to(message, "Usage: /sendfile @username_or_id\nThen send the file.")
         return
     target = args[1]
-    PENDING_UPLOADS[message.from_user.id] = target
-    bot.reply_to(message, f"Send the file now (will be sent to {target}).")
+    PENDING_UPLOADS[message.from_user.id] = (target, message.chat.id, message.message_id)
+    bot.reply_to(message, f"Send the file now (will be sent to {target}).\nSupported: photo, video, audio, document. Max size per part: {CHUNK_SIZE//(1024*1024)}MB")
 
 @bot.message_handler(commands=['history'])
 def history_handler(message):
@@ -366,7 +367,10 @@ def file_received(message):
     if message.from_user.id not in PENDING_UPLOADS:
         bot.reply_to(message, "No pending upload. Use /sendfile first.")
         return
-    target = PENDING_UPLOADS.pop(message.from_user.id)
+
+    target, admin_chat_id, admin_msg_id = PENDING_UPLOADS.pop(message.from_user.id)
+    bot.send_message(admin_chat_id, f"File received. Sending to {target}...")
+
     file_info = None
     if message.document:
         file_info = message.document
@@ -376,16 +380,30 @@ def file_received(message):
         file_info = message.video
     elif message.audio:
         file_info = message.audio
+
     if not file_info:
-        bot.reply_to(message, "Unsupported file type.")
+        bot.send_message(admin_chat_id, "Unsupported file type.")
         return
+
     file_id = file_info.file_id
-    file_path = bot.get_file(file_id).file_path
-    downloaded = bot.download_file(file_path)
-    temp_path = f"downloads/tg_{file_id}.tmp"
-    with open(temp_path, 'wb') as f:
-        f.write(downloaded)
-    asyncio.run_coroutine_threadsafe(send_tg_file(target, temp_path, message), tg_loop)
+    file_name = getattr(file_info, 'file_name', f"file_{file_id}")
+    if message.photo:
+        file_name = f"photo_{file_id}.jpg"
+
+    status_msg = bot.send_message(admin_chat_id, f"Downloading {file_name}...")
+    try:
+        downloaded = bot.download_file(file_id)
+        temp_path = f"downloads/bale_{file_id}_{os.path.basename(file_name)}"
+        with open(temp_path, 'wb') as f:
+            f.write(downloaded)
+        bot.edit_message_text(f"Downloaded. Size: {os.path.getsize(temp_path)/(1024*1024):.1f} MB. Sending to Telegram...",
+                              admin_chat_id, status_msg.message_id)
+        asyncio.run_coroutine_threadsafe(
+            send_tg_file(target, temp_path, message, admin_chat_id, status_msg.message_id),
+            tg_loop
+        )
+    except Exception as e:
+        bot.edit_message_text(f"Download failed: {str(e)}", admin_chat_id, status_msg.message_id)
 
 async def join_channel(target, reply_to_bale_msg=None):
     try:
@@ -423,25 +441,56 @@ async def send_tg_text(target, text):
     except Exception as e:
         print(f"Error sending message: {e}")
 
-async def send_tg_file(target, file_path, reply_to_bale_msg=None):
+async def send_tg_file(target, file_path, original_bale_message, admin_chat_id, status_msg_id):
     try:
         entity = await client.get_entity(target)
-        size = os.path.getsize(file_path)
-        if size > CHUNK_SIZE:
+        file_size = os.path.getsize(file_path)
+        file_name = os.path.basename(file_path)
+
+        bot.edit_message_text(f"Sending {file_name} ({file_size/(1024*1024):.1f} MB) to {target}...",
+                              admin_chat_id, status_msg_id)
+
+        ext = os.path.splitext(file_name)[1].lower()
+        is_audio = ext in ('.mp3', '.m4a', '.ogg', '.wav', '.flac')
+        is_video = ext in ('.mp4', '.mkv', '.avi', '.mov', '.webm')
+        is_photo = ext in ('.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp')
+
+        if file_size > CHUNK_SIZE:
             parts = split_file(file_path, CHUNK_SIZE)
-            for part in parts:
-                await client.send_file(entity, part)
-                os.remove(part)
-            if reply_to_bale_msg:
-                bot.reply_to(reply_to_bale_msg, "File sent in parts.")
+            bot.edit_message_text(f"File large. Splitting into {len(parts)} parts...",
+                                  admin_chat_id, status_msg_id)
+            for idx, part_path in enumerate(parts, 1):
+                await client.send_file(entity, part_path, force_document=True)
+                os.remove(part_path)
+                bot.send_message(admin_chat_id, f"Part {idx}/{len(parts)} sent.")
+            reassembly_cmd = f"cat {os.path.splitext(file_name)[0]}.part*{ext} > {file_name}"
+            bot.send_message(admin_chat_id,
+                             f"Original file sent as {len(parts)} parts.\nTo reassemble on Linux:\n`{reassembly_cmd}`",
+                             parse_mode="Markdown")
+            os.remove(file_path)
+            return
+
+        if is_photo:
+            await client.send_file(entity, file_path, force_document=False, photo=True)
+        elif is_video:
+            await client.send_file(entity, file_path, force_document=False, video=True)
+        elif is_audio:
+            await client.send_file(entity, file_path, force_document=False, audio=True)
         else:
-            await client.send_file(entity, file_path)
-            if reply_to_bale_msg:
-                bot.reply_to(reply_to_bale_msg, "File sent.")
+            await client.send_file(entity, file_path, force_document=True)
+
+        bot.edit_message_text(f"File {file_name} sent successfully to {target}.",
+                              admin_chat_id, status_msg_id)
         os.remove(file_path)
+        bot.send_message(admin_chat_id,
+                         f"Sent to {target}.",
+                         reply_markup=InlineKeyboardMarkup().add(
+                             InlineKeyboardButton("History (5)", callback_data=f"history:{target}:5")
+                         ))
     except Exception as e:
-        if reply_to_bale_msg:
-            bot.reply_to(reply_to_bale_msg, f"Error: {e}")
+        bot.edit_message_text(f"Send failed: {str(e)}", admin_chat_id, status_msg_id)
+        if os.path.exists(file_path):
+            os.remove(file_path)
 
 async def forward_tg_message(from_chat_id, msg_id, target, reply_to_bale_msg):
     try:
@@ -788,4 +837,5 @@ def start_telegram():
 
 threading.Thread(target=start_telegram, daemon=True).start()
 
+print("Bale bot started...")
 bot.infinity_polling(skip_pending=True)
